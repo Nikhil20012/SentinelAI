@@ -132,8 +132,8 @@ Phase 1: Simulator (in progress)
 - [x] Base interfaces (BaseEnvironment, BasePolicy, BaseReward)
 - [x] YAML-driven environment configs
 - [x] Config loading and validation tests
-- [ ] Urban environment (PettingZoo ParallelEnv)
-- [ ] Anomaly generation (Poisson, spatial correlation, moving hotspots)
+- [x] Urban environment (PettingZoo ParallelEnv)
+- [x] Anomaly generation (Poisson, spatial correlation, moving hotspots)
 - [ ] Weather state machine
 - [ ] Infrastructure failure model
 - [ ] Domain randomization
