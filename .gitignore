@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Experiment outputs
+evaluation/results/
+wandb/
+checkpoints/
+
+# Environment
+.env
+
+# Docker volumes
+docker/volumes/
+
+# Jupyter
+.ipynb_checkpoints/
