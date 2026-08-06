@@ -8,8 +8,6 @@ as nested dicts keyed by agent id.
 from abc import ABC, abstractmethod
 from typing import Any
 
-import numpy as np
-
 
 class BaseEnvironment(ABC):
     """Abstract base for all SentinelAI environments.

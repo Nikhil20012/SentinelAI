@@ -1,14 +1,14 @@
 """Tests for configuration loading and validation."""
 
-import pytest
 from pathlib import Path
+
+import pytest
 
 from sentinel.config import (
     EnvironmentConfig,
-    ZoneConfig,
     WeatherConfig,
-    load_config,
     env_config_from_dict,
+    load_config,
 )
 
 CONFIGS_DIR = Path(__file__).parent.parent / "configs" / "environments"
