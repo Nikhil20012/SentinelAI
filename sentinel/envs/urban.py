@@ -42,6 +42,10 @@ from sentinel.envs.constants import (
     TIER_MAX_BW_COST,
     TIER_MAX_GPU_COST,
     TIME_PROFILES,
+    WEATHER_ANOMALY_MODIFIER,
+    WEATHER_BANDWIDTH_MODIFIER,
+    WEATHER_CONFIDENCE_PENALTY,
+    WEATHER_STATES,
 )
 
 logger = logging.getLogger(__name__)
@@ -97,6 +101,16 @@ class UrbanEnvironment(BaseEnvironment):
         self._bw_costs: np.ndarray | None = None
         self._spatial_boost: np.ndarray | None = None
         self._hotspots: list[dict] = []
+
+        # Infrastructure failure tracking
+        # Per-camera dropout countdown (0 = operational, >0 = offline for N more steps)
+        self._camera_dropout: np.ndarray | None = None
+        # Per-zone GPU failure countdown and capacity loss
+        self._gpu_failure_remaining: np.ndarray | None = None
+        self._gpu_failure_loss: np.ndarray | None = None
+        # Per-zone network congestion countdown and bandwidth loss
+        self._net_congestion_remaining: np.ndarray | None = None
+        self._net_congestion_loss: np.ndarray | None = None
 
         self._timestep = 0
         self._time_of_day = 0.0
@@ -175,9 +189,32 @@ class UrbanEnvironment(BaseEnvironment):
         self._rng = np.random.default_rng(seed)
         self._timestep = 0
         self._time_of_day = self._rng.uniform(0.0, 1.0)
-        self._weather = 0
 
         shape = (self._n_zones, self._max_cams)
+
+        # Apply domain randomization if enabled
+        dr = self._config.domain_randomization
+        if dr.enabled:
+            self._cams_per_zone = self._randomize_camera_counts()
+            self._config.resources.total_gpu_budget = float(
+                self._rng.uniform(dr.gpu_budget_range[0], dr.gpu_budget_range[1])
+            )
+            self._config.resources.total_bandwidth_budget = float(
+                self._rng.uniform(
+                    dr.bandwidth_budget_range[0], dr.bandwidth_budget_range[1]
+                )
+            )
+        else:
+            self._cams_per_zone = np.array(
+                [z.max_cameras for z in self._config.zones], dtype=np.int32
+            )
+
+        # Weather: start at configured initial state
+        weather_name = self._config.weather.initial_state
+        if weather_name in WEATHER_STATES:
+            self._weather = WEATHER_STATES.index(weather_name)
+        else:
+            self._weather = 0
 
         # All cameras start at minimum quality
         self._res = np.zeros(shape, dtype=np.int32)
@@ -195,6 +232,13 @@ class UrbanEnvironment(BaseEnvironment):
         # Spatial correlation tracking and moving hotspots
         self._spatial_boost = np.zeros(shape, dtype=np.float32)
         self._hotspots = []
+
+        # Infrastructure failures start clean
+        self._camera_dropout = np.zeros(shape, dtype=np.int32)
+        self._gpu_failure_remaining = np.zeros(self._n_zones, dtype=np.int32)
+        self._gpu_failure_loss = np.zeros(self._n_zones, dtype=np.float32)
+        self._net_congestion_remaining = np.zeros(self._n_zones, dtype=np.int32)
+        self._net_congestion_loss = np.zeros(self._n_zones, dtype=np.float32)
 
         # Even budget split across zones
         frac = 1.0 / self._n_zones
@@ -223,6 +267,8 @@ class UrbanEnvironment(BaseEnvironment):
         self._timestep += 1
         self._time_of_day = (self._time_of_day + 1.0 / self._episode_len) % 1.0
 
+        self._update_weather()
+        self._update_failures()
         self._update_hotspots()
         self._generate_anomalies()
         self._update_spatial_boost()
@@ -298,14 +344,19 @@ class UrbanEnvironment(BaseEnvironment):
         self._anomaly[~self._active] = 0.0
 
     def _compute_base_rates(self) -> np.ndarray:
-        """Per-camera anomaly rates from zone config, time-of-day, and hotspots."""
+        """Per-camera anomaly rates from zone config, time-of-day, weather, and hotspots."""
         rates = np.zeros((self._n_zones, self._max_cams), dtype=np.float32)
         hour = self._time_of_day * 24.0
+        weather_name = WEATHER_STATES[self._weather]
+        weather_mods = WEATHER_ANOMALY_MODIFIER[weather_name]
 
         for z in range(self._n_zones):
             zone_cfg = self._config.zones[z]
             time_mult = _interpolate_time_profile(zone_cfg.zone_type, hour)
-            rates[z, : self._cams_per_zone[z]] = zone_cfg.base_anomaly_rate * time_mult
+            weather_mult = weather_mods.get(zone_cfg.zone_type, 1.0)
+            rates[z, : self._cams_per_zone[z]] = (
+                zone_cfg.base_anomaly_rate * time_mult * weather_mult
+            )
 
         # Hotspot contribution: cameras near the center get elevated rates
         for h in self._hotspots:
@@ -382,16 +433,117 @@ class UrbanEnvironment(BaseEnvironment):
                     "remaining": lifetime,
                 })
 
+    def _update_weather(self) -> None:
+        """Transition weather state using the configured Markov chain."""
+        matrix = self._config.weather.transition_matrix
+        row = matrix[self._weather]
+        self._weather = int(self._rng.choice(NUM_WEATHER_STATES, p=row))
+
+    def _update_failures(self) -> None:
+        """Tick down active failures and randomly inject new ones."""
+        fc = self._config.failures
+
+        # Tick down existing failures
+        self._camera_dropout = np.maximum(self._camera_dropout - 1, 0)
+        self._gpu_failure_remaining = np.maximum(
+            self._gpu_failure_remaining - 1, 0
+        )
+        self._net_congestion_remaining = np.maximum(
+            self._net_congestion_remaining - 1, 0
+        )
+
+        # Clear loss values when failures expire
+        self._gpu_failure_loss[self._gpu_failure_remaining == 0] = 0.0
+        self._net_congestion_loss[self._net_congestion_remaining == 0] = 0.0
+
+        # Inject new camera dropouts
+        if fc.camera_dropout_prob > 0:
+            for z in range(self._n_zones):
+                for c in range(int(self._cams_per_zone[z])):
+                    if (
+                        self._camera_dropout[z, c] == 0
+                        and self._rng.random() < fc.camera_dropout_prob
+                    ):
+                        self._camera_dropout[z, c] = fc.camera_dropout_duration
+
+        # Inject GPU failures (per zone)
+        if fc.gpu_failure_prob > 0:
+            for z in range(self._n_zones):
+                if (
+                    self._gpu_failure_remaining[z] == 0
+                    and self._rng.random() < fc.gpu_failure_prob
+                ):
+                    self._gpu_failure_remaining[z] = fc.gpu_failure_duration
+                    self._gpu_failure_loss[z] = fc.gpu_failure_capacity_loss
+
+        # Inject network congestion (per zone)
+        if fc.network_congestion_prob > 0:
+            for z in range(self._n_zones):
+                if (
+                    self._net_congestion_remaining[z] == 0
+                    and self._rng.random() < fc.network_congestion_prob
+                ):
+                    self._net_congestion_remaining[z] = (
+                        fc.network_congestion_duration
+                    )
+                    self._net_congestion_loss[z] = (
+                        fc.network_congestion_bandwidth_loss
+                    )
+
+        # Update active mask: cameras with dropout are temporarily inactive
+        self._active[:] = False
+        for z in range(self._n_zones):
+            for c in range(int(self._cams_per_zone[z])):
+                if self._camera_dropout[z, c] == 0:
+                    self._active[z, c] = True
+
+    def _effective_zone_gpu_budget(self, zone_idx: int) -> float:
+        """Zone GPU budget reduced by any active GPU failure."""
+        base = self._zone_gpu_budget[zone_idx]
+        loss = self._gpu_failure_loss[zone_idx]
+        return base * (1.0 - loss)
+
+    def _effective_zone_bw_budget(self, zone_idx: int) -> float:
+        """Zone bandwidth budget reduced by congestion and weather."""
+        base = self._zone_bw_budget[zone_idx]
+        congestion_loss = self._net_congestion_loss[zone_idx]
+        weather_mod = WEATHER_BANDWIDTH_MODIFIER[WEATHER_STATES[self._weather]]
+        return base * (1.0 - congestion_loss) * weather_mod
+
+    def _randomize_camera_counts(self) -> np.ndarray:
+        """Randomize per-zone camera counts within configured range."""
+        dr = self._config.domain_randomization
+        lo, hi = dr.camera_count_range
+        # Distribute total cameras across zones
+        total = int(self._rng.integers(lo, hi + 1))
+        per_zone = total // self._n_zones
+        counts = np.full(self._n_zones, per_zone, dtype=np.int32)
+        # Distribute remainder
+        remainder = total - per_zone * self._n_zones
+        for i in range(remainder):
+            counts[i] += 1
+        # Clamp to max_cameras_per_zone
+        counts = np.minimum(counts, self._max_cams)
+        return counts
+
     def _update_confidence(self) -> None:
-        """Detection confidence as a function of camera quality settings.
+        """Detection confidence from quality settings and weather.
 
         Higher resolution, FPS, and model tier produce higher confidence.
+        Weather degrades confidence (fog worst, rain moderate).
         """
-        quality = (self._res + self._fps + self._model).astype(np.float32) / 6.0
+        quality = (
+            (self._res + self._fps + self._model).astype(np.float32) / 6.0
+        )
         noise = self._rng.uniform(
             -0.1, 0.1, size=quality.shape
         ).astype(np.float32)
-        self._confidence = np.clip(0.5 + 0.3 * quality + noise, 0.0, 1.0)
+        weather_penalty = WEATHER_CONFIDENCE_PENALTY[
+            WEATHER_STATES[self._weather]
+        ]
+        self._confidence = np.clip(
+            0.5 + 0.3 * quality + weather_penalty + noise, 0.0, 1.0
+        )
         self._confidence[~self._active] = 0.0
 
     def _update_resource_costs(self) -> None:
@@ -515,8 +667,10 @@ class UrbanEnvironment(BaseEnvironment):
         total_gpu = self._config.resources.total_gpu_budget
         total_bw = self._config.resources.total_bandwidth_budget
 
-        # Count failed cameras (none in skeleton, placeholder for later)
-        failure_count = 0.0
+        # Count failed cameras (currently in dropout)
+        failure_count = float(
+            (self._camera_dropout[z, :int(self._cams_per_zone[z])] > 0).sum()
+        )
 
         return np.concatenate([
             [self._zone_gpu_budget[z] / total_gpu],
@@ -597,8 +751,14 @@ class UrbanEnvironment(BaseEnvironment):
                 continue
 
             # Budget available for this camera = total - everyone else's cost
-            headroom_gpu = self._zone_gpu_budget[z] - (total_gpu - current_gpu[c])
-            headroom_bw = self._zone_bw_budget[z] - (total_bw - current_bw[c])
+            headroom_gpu = (
+                self._effective_zone_gpu_budget(z)
+                - (total_gpu - current_gpu[c])
+            )
+            headroom_bw = (
+                self._effective_zone_bw_budget(z)
+                - (total_bw - current_bw[c])
+            )
 
             for t in range(NUM_TIERS):
                 if (
@@ -656,6 +816,9 @@ class UrbanEnvironment(BaseEnvironment):
             "bw_costs": self._bw_costs.copy(),
             "spatial_boost": self._spatial_boost.copy(),
             "num_hotspots": len(self._hotspots),
+            "camera_dropout": self._camera_dropout.copy(),
+            "gpu_failure_remaining": self._gpu_failure_remaining.copy(),
+            "net_congestion_remaining": self._net_congestion_remaining.copy(),
         }
 
     def _build_infos(self) -> dict[str, dict[str, dict]]:

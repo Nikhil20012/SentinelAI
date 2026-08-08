@@ -53,6 +53,28 @@ FPS_BW_WEIGHT = np.array([0.2, 0.5, 1.0])
 WEATHER_STATES = ["clear", "rain", "fog"]
 NUM_WEATHER_STATES = 3
 
+# Weather effects on detection confidence (additive penalty)
+WEATHER_CONFIDENCE_PENALTY = {
+    "clear": 0.0,
+    "rain": -0.10,
+    "fog": -0.20,
+}
+
+# Weather effects on anomaly rate (multiplier per zone type).
+# Rain increases highway incidents, fog suppresses parking activity, etc.
+WEATHER_ANOMALY_MODIFIER = {
+    "clear": {"commercial": 1.0, "residential": 1.0, "highway": 1.0, "parking": 1.0},
+    "rain": {"commercial": 1.0, "residential": 0.9, "highway": 1.3, "parking": 0.8},
+    "fog": {"commercial": 0.9, "residential": 0.8, "highway": 1.1, "parking": 0.8},
+}
+
+# Weather effects on bandwidth (multiplier, rain/fog degrade wireless links)
+WEATHER_BANDWIDTH_MODIFIER = {
+    "clear": 1.0,
+    "rain": 0.85,
+    "fog": 0.90,
+}
+
 # Zone types
 ZONE_TYPES = ["commercial", "residential", "highway", "parking"]
 
