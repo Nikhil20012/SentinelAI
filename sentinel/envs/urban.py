@@ -38,6 +38,9 @@ from sentinel.envs.constants import (
     NUM_WEATHER_STATES,
     RESOLUTION_BW_WEIGHT,
     RESOLUTION_GPU_WEIGHT,
+    TIER_ACTION_LIMITS,
+    TIER_MAX_BW_COST,
+    TIER_MAX_GPU_COST,
     TIME_PROFILES,
 )
 
@@ -255,15 +258,16 @@ class UrbanEnvironment(BaseEnvironment):
             zone_action = np.asarray(actions["zone"][f"zone_{z}"])
             self._tiers[z] = zone_action
 
-        # Camera: update quality settings (no tier enforcement yet)
+        # Camera: update quality settings, clamped to tier limits
         for z in range(self._n_zones):
             for c in range(self._max_cams):
                 if not self._active[z, c]:
                     continue
                 cam_action = np.asarray(actions["camera"][f"cam_{z}_{c}"])
-                self._res[z, c] = cam_action[0]
-                self._fps[z, c] = cam_action[1]
-                self._model[z, c] = cam_action[2]
+                limits = TIER_ACTION_LIMITS[self._tiers[z, c]]
+                self._res[z, c] = min(int(cam_action[0]), int(limits[0]))
+                self._fps[z, c] = min(int(cam_action[1]), int(limits[1]))
+                self._model[z, c] = min(int(cam_action[2]), int(limits[2]))
 
     # -- World simulation --
 
@@ -539,21 +543,95 @@ class UrbanEnvironment(BaseEnvironment):
         """Return masks where 1 = valid action, 0 = masked.
 
         For MultiDiscrete spaces, the mask is a flat 1D array of length
-        sum(nvec). Each segment of length nvec[i] is a binary mask for
-        that dimension. This matches RLlib's expected format.
+        sum(nvec). Each segment corresponds to one discrete dimension.
 
-        Skeleton: all actions valid. Step 3 adds tier-based and budget-based
-        masking.
+        Global controller: all budget levels always valid.
+        Zone controllers: tier masked if its max cost would exceed zone budget
+            headroom (computed assuming other cameras keep their current tier).
+        Camera agents: per-dimension masking from assigned tier limits.
         """
-        masks: dict[str, dict[str, np.ndarray]] = {"global": {}, "zone": {}, "camera": {}}
+        masks: dict[str, dict[str, np.ndarray]] = {
+            "global": {},
+            "zone": {},
+            "camera": {},
+        }
 
-        for level, agents in self._act_spaces.items():
-            for agent_id, space in agents.items():
-                masks[level][agent_id] = np.ones(
-                    int(space.nvec.sum()), dtype=np.int8
-                )
+        # Global: no constraints on budget level assignment
+        global_space = self._act_spaces["global"]["global"]
+        masks["global"]["global"] = np.ones(
+            int(global_space.nvec.sum()), dtype=np.int8
+        )
+
+        # Zone: budget-based tier masking
+        for z in range(self._n_zones):
+            masks["zone"][f"zone_{z}"] = self._build_zone_mask(z)
+
+        # Camera: tier-based per-dimension masking
+        for z in range(self._n_zones):
+            for c in range(self._max_cams):
+                masks["camera"][f"cam_{z}_{c}"] = self._build_camera_mask(z, c)
 
         return masks
+
+    def _build_zone_mask(self, zone_idx: int) -> np.ndarray:
+        """Build tier masks for all cameras in a zone based on budget headroom.
+
+        For each camera, compute how much budget is available assuming all
+        other cameras stay at their current tier. Mask any tier whose max
+        cost would exceed that headroom.
+        """
+        z = zone_idx
+        mask = np.zeros(NUM_TIERS * self._max_cams, dtype=np.int8)
+
+        # Cost of each camera's current tier assignment
+        current_gpu = TIER_MAX_GPU_COST[self._tiers[z]] * self._active[z]
+        current_bw = TIER_MAX_BW_COST[self._tiers[z]] * self._active[z]
+        total_gpu = current_gpu.sum()
+        total_bw = current_bw.sum()
+
+        for c in range(self._max_cams):
+            offset = c * NUM_TIERS
+
+            if not self._active[z, c]:
+                mask[offset] = 1  # inactive cameras locked to minimal
+                continue
+
+            # Budget available for this camera = total - everyone else's cost
+            headroom_gpu = self._zone_gpu_budget[z] - (total_gpu - current_gpu[c])
+            headroom_bw = self._zone_bw_budget[z] - (total_bw - current_bw[c])
+
+            for t in range(NUM_TIERS):
+                if (
+                    TIER_MAX_GPU_COST[t] <= headroom_gpu + 1e-6
+                    and TIER_MAX_BW_COST[t] <= headroom_bw + 1e-6
+                ):
+                    mask[offset + t] = 1
+
+            # Minimal is always valid regardless of budget
+            mask[offset] = 1
+
+        return mask
+
+    def _build_camera_mask(self, zone_idx: int, cam_idx: int) -> np.ndarray:
+        """Build per-dimension action mask for a camera based on its assigned tier."""
+        mask = np.zeros(NUM_QUALITY_LEVELS * 3, dtype=np.int8)
+
+        if not self._active[zone_idx, cam_idx]:
+            # Inactive: only the lowest option per dimension
+            mask[0] = 1
+            mask[NUM_QUALITY_LEVELS] = 1
+            mask[2 * NUM_QUALITY_LEVELS] = 1
+            return mask
+
+        tier = self._tiers[zone_idx, cam_idx]
+        limits = TIER_ACTION_LIMITS[tier]
+
+        for dim in range(3):
+            offset = dim * NUM_QUALITY_LEVELS
+            for i in range(int(limits[dim]) + 1):
+                mask[offset + i] = 1
+
+        return mask
 
     # -- Rendering / logging --
 

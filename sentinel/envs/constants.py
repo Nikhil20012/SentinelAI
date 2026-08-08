@@ -99,3 +99,19 @@ HOTSPOT_LIFETIME_RANGE = (20, 60)
 # Calm cameras produce low scores, event cameras produce high scores
 ANOMALY_BETA_CALM = (1.5, 8.0)
 ANOMALY_BETA_EVENT = (5.0, 2.0)
+
+# Maximum resource cost a camera can incur at each tier.
+# Used by zone controllers to check whether a tier assignment fits the budget.
+# Derived from TIER_ACTION_LIMITS and the cost weight tables.
+TIER_MAX_GPU_COST = np.array([
+    GPU_SCALE
+    * RESOLUTION_GPU_WEIGHT[lim[0]]
+    * FPS_GPU_WEIGHT[lim[1]]
+    * MODEL_GPU_WEIGHT[lim[2]]
+    for lim in TIER_ACTION_LIMITS
+])
+
+TIER_MAX_BW_COST = np.array([
+    BW_SCALE * RESOLUTION_BW_WEIGHT[lim[0]] * FPS_BW_WEIGHT[lim[1]]
+    for lim in TIER_ACTION_LIMITS
+])

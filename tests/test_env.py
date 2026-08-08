@@ -1,14 +1,16 @@
 """Tests for the urban surveillance environment."""
 
 import numpy as np
+import pytest
 
 from sentinel.config import EnvironmentConfig, env_config_from_dict, load_config
+from sentinel.envs.urban import UrbanEnvironment
 from sentinel.envs.constants import (
     NUM_BUDGET_LEVELS,
     NUM_QUALITY_LEVELS,
     NUM_TIERS,
+    BUDGET_FRACTIONS,
 )
-from sentinel.envs.urban import UrbanEnvironment
 
 
 def make_env(config: EnvironmentConfig | None = None) -> UrbanEnvironment:
@@ -210,12 +212,13 @@ class TestBudgetAllocation:
 
         # All zones get "moderate" (index 1, fraction 0.25)
         action = np.ones(n, dtype=np.int64)
+        zone_tiers = {
+            f"zone_{z}": np.full(config.max_cameras_per_zone, 3, dtype=np.int64)
+            for z in range(n)
+        }
         actions = {
             "global": {"global": action},
-            "zone": {
-                f"zone_{z}": np.full(config.max_cameras_per_zone, 3, dtype=np.int64)
-                for z in range(n)
-            },
+            "zone": zone_tiers,
             "camera": {
                 f"cam_{z}_{c}": np.zeros(3, dtype=np.int64)
                 for z in range(n)
@@ -237,12 +240,13 @@ class TestBudgetAllocation:
         # All zones get "critical" (index 3, fraction 0.50)
         # Total = 4 * 0.50 = 2.0, should normalize to 0.25 each
         action = np.full(n, 3, dtype=np.int64)
+        zone_tiers = {
+            f"zone_{z}": np.full(config.max_cameras_per_zone, 3, dtype=np.int64)
+            for z in range(n)
+        }
         actions = {
             "global": {"global": action},
-            "zone": {
-                f"zone_{z}": np.full(config.max_cameras_per_zone, 3, dtype=np.int64)
-                for z in range(n)
-            },
+            "zone": zone_tiers,
             "camera": {
                 f"cam_{z}_{c}": np.zeros(3, dtype=np.int64)
                 for z in range(n)
@@ -414,11 +418,13 @@ class TestAnomalyGeneration:
         env.reset(seed=42)
         env._time_of_day = 0.5  # noon
         env._generate_anomalies()
+        noon_mean = env._anomaly[0, :env._cams_per_zone[0]].mean()
 
         # Collect mean anomaly at "midnight" (time_of_day=0.0)
         env.reset(seed=42)
         env._time_of_day = 0.0  # midnight
         env._generate_anomalies()
+        midnight_mean = env._anomaly[0, :env._cams_per_zone[0]].mean()
 
         # Run enough samples to get stable means
         noon_samples, midnight_samples = [], []
@@ -546,3 +552,226 @@ class TestAnomalyGeneration:
         assert peak_highway != peak_residential, (
             "Highway and residential should peak at different hours"
         )
+
+
+class TestActionMasking:
+    """Tests for tier-based camera masking and budget-based zone masking."""
+
+    def test_camera_mask_minimal_tier(self):
+        """Minimal tier should only allow the lowest option per dimension."""
+        env = make_env()
+        env.reset(seed=42)
+        # Force camera 0 in zone 0 to minimal tier
+        env._tiers[0, 0] = 0
+        mask = env._build_camera_mask(0, 0)
+        # mask layout: [res0, res1, res2, fps0, fps1, fps2, mod0, mod1, mod2]
+        expected = np.array([1, 0, 0, 1, 0, 0, 1, 0, 0], dtype=np.int8)
+        np.testing.assert_array_equal(mask, expected)
+
+    def test_camera_mask_normal_tier(self):
+        """Normal tier allows indices 0-1 for all three dimensions."""
+        env = make_env()
+        env.reset(seed=42)
+        env._tiers[0, 0] = 1
+        mask = env._build_camera_mask(0, 0)
+        expected = np.array([1, 1, 0, 1, 1, 0, 1, 1, 0], dtype=np.int8)
+        np.testing.assert_array_equal(mask, expected)
+
+    def test_camera_mask_elevated_tier(self):
+        """Elevated: res up to 2, fps/model up to 1."""
+        env = make_env()
+        env.reset(seed=42)
+        env._tiers[0, 0] = 2
+        mask = env._build_camera_mask(0, 0)
+        expected = np.array([1, 1, 1, 1, 1, 0, 1, 1, 0], dtype=np.int8)
+        np.testing.assert_array_equal(mask, expected)
+
+    def test_camera_mask_priority_tier(self):
+        """Priority tier should allow everything."""
+        env = make_env()
+        env.reset(seed=42)
+        env._tiers[0, 0] = 3
+        mask = env._build_camera_mask(0, 0)
+        expected = np.ones(9, dtype=np.int8)
+        np.testing.assert_array_equal(mask, expected)
+
+    def test_camera_mask_inactive(self):
+        """Inactive cameras should only allow the lowest option per dimension."""
+        config = EnvironmentConfig()
+        config.zones[0].max_cameras = 5
+        env = UrbanEnvironment(config)
+        env.reset(seed=42)
+        # Camera 10 in zone 0 is inactive
+        mask = env._build_camera_mask(0, 10)
+        expected = np.array([1, 0, 0, 1, 0, 0, 1, 0, 0], dtype=np.int8)
+        np.testing.assert_array_equal(mask, expected)
+
+    def test_zone_mask_generous_budget(self):
+        """With a large budget, all tiers should be available for active cameras."""
+        env = make_env()
+        env.reset(seed=42)
+        # Give zone 0 a very large budget
+        env._zone_gpu_budget[0] = 1000.0
+        env._zone_bw_budget[0] = 1000.0
+        # All cameras at minimal currently
+        env._tiers[0, :] = 0
+        mask = env._build_zone_mask(0)
+
+        # Check first active camera: all 4 tiers should be valid
+        active_cam_tiers = mask[:4]
+        np.testing.assert_array_equal(
+            active_cam_tiers, np.ones(4, dtype=np.int8)
+        )
+
+    def test_zone_mask_tight_budget(self):
+        """With a very tight budget, only minimal should be available."""
+        env = make_env()
+        env.reset(seed=42)
+        # Tiny budget: only enough for all cameras at minimal
+        env._zone_gpu_budget[0] = 0.5
+        env._zone_bw_budget[0] = 0.5
+        env._tiers[0, :] = 0
+        mask = env._build_zone_mask(0)
+
+        # For each active camera, check which tiers are allowed
+        n_active = int(env._cams_per_zone[0])
+        for c in range(n_active):
+            offset = c * 4
+            # Minimal should always be valid
+            assert mask[offset] == 1
+            # Priority (tier 3, cost=6.0) should be masked with 0.5 budget
+            assert mask[offset + 3] == 0
+
+    def test_zone_mask_inactive_camera_locked_to_minimal(self):
+        """Inactive cameras should only have minimal tier available."""
+        config = EnvironmentConfig()
+        config.zones[0].max_cameras = 5
+        env = UrbanEnvironment(config)
+        env.reset(seed=42)
+        env._zone_gpu_budget[0] = 1000.0
+        env._zone_bw_budget[0] = 1000.0
+        mask = env._build_zone_mask(0)
+
+        # Camera index 10 (inactive) should only allow minimal
+        offset = 10 * 4
+        expected = np.array([1, 0, 0, 0], dtype=np.int8)
+        np.testing.assert_array_equal(mask[offset:offset + 4], expected)
+
+    def test_tier_enforcement_clamps_actions(self):
+        """Camera actions should be clamped to tier limits even if
+        the policy outputs higher values."""
+        env = make_env()
+        env.reset(seed=42)
+        config = EnvironmentConfig()
+        n = config.num_zones
+        k = config.max_cameras_per_zone
+
+        # Set all cameras to minimal tier
+        zone_actions = {
+            f"zone_{z}": np.zeros(k, dtype=np.int64)
+            for z in range(n)
+        }
+        # But camera actions request max quality (2, 2, 2)
+        camera_actions = {
+            f"cam_{z}_{c}": np.array([2, 2, 2], dtype=np.int64)
+            for z in range(n)
+            for c in range(k)
+        }
+        actions = {
+            "global": {"global": np.ones(n, dtype=np.int64)},
+            "zone": zone_actions,
+            "camera": camera_actions,
+        }
+        env.step(actions)
+
+        # All cameras should be clamped to (0, 0, 0) since minimal tier
+        for z in range(n):
+            for c in range(k):
+                if env._active[z, c]:
+                    assert env._res[z, c] == 0
+                    assert env._fps[z, c] == 0
+                    assert env._model[z, c] == 0
+
+    def test_elevated_tier_partial_clamp(self):
+        """Elevated tier allows res=2 but limits fps and model to 1."""
+        env = make_env()
+        env.reset(seed=42)
+        config = EnvironmentConfig()
+        n = config.num_zones
+        k = config.max_cameras_per_zone
+
+        zone_actions = {
+            f"zone_{z}": np.full(k, 2, dtype=np.int64)  # elevated tier
+            for z in range(n)
+        }
+        camera_actions = {
+            f"cam_{z}_{c}": np.array([2, 2, 2], dtype=np.int64)
+            for z in range(n)
+            for c in range(k)
+        }
+        actions = {
+            "global": {"global": np.ones(n, dtype=np.int64)},
+            "zone": zone_actions,
+            "camera": camera_actions,
+        }
+        env.step(actions)
+
+        # res should stay at 2, fps and model clamped to 1
+        for z in range(n):
+            for c in range(k):
+                if env._active[z, c]:
+                    assert env._res[z, c] == 2
+                    assert env._fps[z, c] == 1
+                    assert env._model[z, c] == 1
+
+    def test_full_action_masks_structure(self):
+        """action_masks() should return the full nested dict with correct shapes."""
+        env = make_env()
+        env.reset(seed=42)
+        masks = env.action_masks()
+        spaces = env.action_spaces()
+
+        for level in ["global", "zone", "camera"]:
+            for agent_id, space in spaces[level].items():
+                expected_len = int(space.nvec.sum())
+                assert masks[level][agent_id].shape == (expected_len,)
+                # Every mask should have at least one valid option per dimension
+                assert masks[level][agent_id].sum() > 0
+
+    def test_masks_respect_tier_after_step(self):
+        """After a step that sets tiers, camera masks should reflect them."""
+        env = make_env()
+        env.reset(seed=42)
+        config = EnvironmentConfig()
+        n = config.num_zones
+        k = config.max_cameras_per_zone
+
+        # Set zone 0 cameras to normal tier (1), zone 1+ to priority
+        zone_actions = {}
+        for z in range(n):
+            if z == 0:
+                zone_actions[f"zone_{z}"] = np.ones(k, dtype=np.int64)
+            else:
+                zone_actions[f"zone_{z}"] = np.full(k, 3, dtype=np.int64)
+
+        actions = {
+            "global": {"global": np.ones(n, dtype=np.int64)},
+            "zone": zone_actions,
+            "camera": {
+                f"cam_{z}_{c}": np.zeros(3, dtype=np.int64)
+                for z in range(n)
+                for c in range(k)
+            },
+        }
+        env.step(actions)
+        masks = env.action_masks()
+
+        # Zone 0 camera 0: normal tier, should not allow index 2 for any dim
+        cam_mask = masks["camera"]["cam_0_0"]
+        assert cam_mask[2] == 0  # res=1080p masked
+        assert cam_mask[5] == 0  # fps=30 masked
+        assert cam_mask[8] == 0  # model=heavy masked
+
+        # Zone 1 camera 0: priority tier, everything open
+        cam_mask_p = masks["camera"]["cam_1_0"]
+        np.testing.assert_array_equal(cam_mask_p, np.ones(9, dtype=np.int8))
