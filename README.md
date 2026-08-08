@@ -134,6 +134,7 @@ Phase 1: Simulator (in progress)
 - [x] Config loading and validation tests
 - [x] Urban environment (PettingZoo ParallelEnv)
 - [x] Anomaly generation (Poisson, spatial correlation, moving hotspots)
+- [x] Resource budgets and action masking
 - [ ] Weather state machine
 - [ ] Infrastructure failure model
 - [ ] Domain randomization

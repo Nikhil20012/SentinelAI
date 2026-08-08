@@ -1,16 +1,14 @@
 """Tests for the urban surveillance environment."""
 
 import numpy as np
-import pytest
 
 from sentinel.config import EnvironmentConfig, env_config_from_dict, load_config
-from sentinel.envs.urban import UrbanEnvironment
 from sentinel.envs.constants import (
     NUM_BUDGET_LEVELS,
     NUM_QUALITY_LEVELS,
     NUM_TIERS,
-    BUDGET_FRACTIONS,
 )
+from sentinel.envs.urban import UrbanEnvironment
 
 
 def make_env(config: EnvironmentConfig | None = None) -> UrbanEnvironment:
@@ -418,13 +416,13 @@ class TestAnomalyGeneration:
         env.reset(seed=42)
         env._time_of_day = 0.5  # noon
         env._generate_anomalies()
-        noon_mean = env._anomaly[0, :env._cams_per_zone[0]].mean()
+        #noon_mean = env._anomaly[0, :env._cams_per_zone[0]].mean()
 
         # Collect mean anomaly at "midnight" (time_of_day=0.0)
         env.reset(seed=42)
         env._time_of_day = 0.0  # midnight
         env._generate_anomalies()
-        midnight_mean = env._anomaly[0, :env._cams_per_zone[0]].mean()
+        #midnight_mean = env._anomaly[0, :env._cams_per_zone[0]].mean()
 
         # Run enough samples to get stable means
         noon_samples, midnight_samples = [], []
