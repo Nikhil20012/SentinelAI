@@ -126,7 +126,7 @@ patterns, weather effects, spatial correlation, and infrastructure failures.
 
 ## Current status
 
-Phase 1: Simulator (in progress)
+Phase 1: Simulator (complete)
 
 - [x] Project structure and configuration system
 - [x] Base interfaces (BaseEnvironment, BasePolicy, BaseReward)
@@ -135,11 +135,11 @@ Phase 1: Simulator (in progress)
 - [x] Urban environment (PettingZoo ParallelEnv)
 - [x] Anomaly generation (Poisson, spatial correlation, moving hotspots)
 - [x] Resource budgets and action masking
-- [ ] Weather state machine
-- [ ] Infrastructure failure model
-- [ ] Domain randomization
-- [ ] Scenario presets
-- [ ] Simulator validation plots
+- [x] Weather state machine
+- [x] Infrastructure failure model
+- [x] Domain randomization
+- [x] Scenario presets
+- [x] Simulator validation plots
 
 ## Build roadmap
 
