@@ -2,7 +2,12 @@
 
 import numpy as np
 
-from sentinel.config import EnvironmentConfig, env_config_from_dict, load_config
+from sentinel.config import (
+    DomainRandomizationConfig,
+    EnvironmentConfig,
+    env_config_from_dict,
+    load_config,
+)
 from sentinel.envs.constants import (
     NUM_BUDGET_LEVELS,
     NUM_QUALITY_LEVELS,
@@ -773,3 +778,233 @@ class TestActionMasking:
         # Zone 1 camera 0: priority tier, everything open
         cam_mask_p = masks["camera"]["cam_1_0"]
         np.testing.assert_array_equal(cam_mask_p, np.ones(9, dtype=np.int8))
+
+
+class TestWeather:
+    """Tests for the Markov weather state machine."""
+
+    def test_weather_transitions_occur(self):
+        """Running many steps should produce at least one weather change."""
+        env = make_env()
+        env.reset(seed=42)
+        rng = np.random.default_rng(42)
+        states_seen = {env._weather}
+        for _ in range(200):
+            env.step(sample_random_actions(env, rng))
+            states_seen.add(env._weather)
+        assert len(states_seen) > 1, "Weather should transition at least once"
+
+    def test_fog_reduces_confidence(self):
+        """Fog weather should lower detection confidence compared to clear."""
+        env = make_env()
+        env.reset(seed=42)
+        env._weather = 0  # clear
+        env._update_confidence()
+        clear_conf = env._confidence[env._active].mean()
+
+        env._weather = 2  # fog
+        env._update_confidence()
+        fog_conf = env._confidence[env._active].mean()
+        assert fog_conf < clear_conf
+
+    def test_rain_boosts_highway_anomaly(self):
+        """Rain should increase anomaly rates for highway zones."""
+        env = make_env()
+        env.reset(seed=42)
+        env._weather = 0
+        rates_clear = env._compute_base_rates()
+        env._weather = 1  # rain
+        rates_rain = env._compute_base_rates()
+
+        # Highway is zone index 2 in the default 4-zone config
+        hw_z = 2
+        n = int(env._cams_per_zone[hw_z])
+        assert rates_rain[hw_z, :n].sum() > rates_clear[hw_z, :n].sum()
+
+    def test_weather_stays_valid(self):
+        """Weather index should always be 0, 1, or 2."""
+        env = make_env()
+        env.reset(seed=42)
+        rng = np.random.default_rng(42)
+        for _ in range(100):
+            env.step(sample_random_actions(env, rng))
+            assert 0 <= env._weather <= 2
+
+
+class TestFailures:
+    """Tests for infrastructure failure injection and recovery."""
+
+    def test_camera_dropout_deactivates(self):
+        """A camera in dropout should be marked inactive."""
+        env = make_env()
+        env.reset(seed=42)
+        env._camera_dropout[0, 0] = 5
+        env._update_failures()
+        assert not env._active[0, 0]
+
+    def test_camera_recovers_after_countdown(self):
+        """Camera should become active again when dropout countdown hits 0."""
+        config = EnvironmentConfig()
+        # Zero injection prob so recovery isn't overwritten by a new failure
+        config.failures.camera_dropout_prob = 0.0
+        env = UrbanEnvironment(config)
+        env.reset(seed=42)
+        env._camera_dropout[0, 0] = 1
+        env._update_failures()
+        assert env._active[0, 0], "Camera should recover when dropout expires"
+
+    def test_gpu_failure_reduces_effective_budget(self):
+        """Active GPU failure should reduce the effective zone budget."""
+        env = make_env()
+        env.reset(seed=42)
+        env._zone_gpu_budget[0] = 50.0
+        env._gpu_failure_remaining[0] = 10
+        env._gpu_failure_loss[0] = 0.3
+        effective = env._effective_zone_gpu_budget(0)
+        assert abs(effective - 35.0) < 0.01
+
+    def test_network_congestion_reduces_bandwidth(self):
+        """Active network congestion should reduce effective bandwidth."""
+        env = make_env()
+        env.reset(seed=42)
+        env._zone_bw_budget[0] = 100.0
+        env._net_congestion_remaining[0] = 10
+        env._net_congestion_loss[0] = 0.4
+        effective = env._effective_zone_bw_budget(0)
+        # 100 * (1 - 0.4) * weather_modifier(clear=1.0) = 60
+        assert abs(effective - 60.0) < 0.01
+
+    def test_failures_inject_with_high_prob(self):
+        """With high failure probability, failures should appear quickly."""
+        config = EnvironmentConfig()
+        config.failures.camera_dropout_prob = 0.5
+        config.failures.gpu_failure_prob = 0.3
+        config.failures.network_congestion_prob = 0.3
+        env = UrbanEnvironment(config)
+        env.reset(seed=42)
+        rng = np.random.default_rng(42)
+        saw_dropout = False
+        saw_gpu = False
+        for _ in range(50):
+            env.step(sample_random_actions(env, rng))
+            if (env._camera_dropout > 0).any():
+                saw_dropout = True
+            if (env._gpu_failure_remaining > 0).any():
+                saw_gpu = True
+        assert saw_dropout
+        assert saw_gpu
+
+    def test_failure_clears_on_expiry(self):
+        """GPU failure loss should reset to 0 when the countdown expires."""
+        config = EnvironmentConfig()
+        config.failures.gpu_failure_prob = 0.0
+        env = UrbanEnvironment(config)
+        env.reset(seed=42)
+        env._gpu_failure_remaining[0] = 1
+        env._gpu_failure_loss[0] = 0.3
+        env._update_failures()
+        assert env._gpu_failure_remaining[0] == 0
+        assert env._gpu_failure_loss[0] == 0.0
+
+
+class TestDomainRandomization:
+    """Tests for domain randomization during reset."""
+
+    def test_camera_counts_vary(self):
+        """Multiple resets with DR enabled should produce different counts."""
+        config = EnvironmentConfig()
+        config.domain_randomization = DomainRandomizationConfig(
+            enabled=True,
+            camera_count_range=[4, 12],
+            gpu_budget_range=[50.0, 80.0],
+            bandwidth_budget_range=[50.0, 80.0],
+        )
+        env = UrbanEnvironment(config)
+        counts = set()
+        for seed in range(20):
+            env.reset(seed=seed)
+            counts.add(env.num_cameras)
+        assert len(counts) > 1
+
+    def test_camera_counts_within_bounds(self):
+        """Camera count should stay within the configured range."""
+        config = EnvironmentConfig()
+        config.domain_randomization = DomainRandomizationConfig(
+            enabled=True,
+            camera_count_range=[5, 10],
+        )
+        env = UrbanEnvironment(config)
+        for seed in range(30):
+            env.reset(seed=seed)
+            assert 5 <= env.num_cameras <= 10
+
+    def test_budget_varies(self):
+        """GPU budget should vary across resets with DR enabled."""
+        config = EnvironmentConfig()
+        config.domain_randomization = DomainRandomizationConfig(
+            enabled=True,
+            gpu_budget_range=[40.0, 90.0],
+            bandwidth_budget_range=[40.0, 90.0],
+        )
+        env = UrbanEnvironment(config)
+        budgets = set()
+        for seed in range(20):
+            env.reset(seed=seed)
+            budgets.add(round(config.resources.total_gpu_budget, 1))
+        assert len(budgets) > 1
+
+    def test_dr_disabled_keeps_constant(self):
+        """With DR disabled, camera count should be constant across resets."""
+        config = EnvironmentConfig()
+        config.domain_randomization.enabled = False
+        env = UrbanEnvironment(config)
+        counts = set()
+        for seed in range(10):
+            env.reset(seed=seed)
+            counts.add(env.num_cameras)
+        assert len(counts) == 1
+
+
+class TestScenarioPresets:
+    """Verify all scenario preset configs load and run."""
+
+    PRESETS = [
+        "urban_normal",
+        "urban_rush_hour",
+        "urban_resource_crunch",
+        "urban_infrastructure_stress",
+        "urban_incident_cascade",
+        "urban_mixed",
+    ]
+
+    def test_all_presets_load_and_step(self):
+        for preset in self.PRESETS:
+            raw = load_config(f"configs/environments/{preset}.yaml")
+            config = env_config_from_dict(raw)
+            env = UrbanEnvironment(config)
+            obs = env.reset(seed=42)
+            rng = np.random.default_rng(42)
+            obs, _, _, _, _ = env.step(sample_random_actions(env, rng))
+            spaces = env.observation_spaces()
+            for level in spaces:
+                for aid, space in spaces[level].items():
+                    assert obs[level][aid].shape == space.shape, (
+                        f"{preset}: {aid} shape mismatch"
+                    )
+
+    def test_resource_crunch_has_lower_budget(self):
+        raw = load_config("configs/environments/urban_resource_crunch.yaml")
+        config = env_config_from_dict(raw)
+        assert config.resources.total_gpu_budget == 50.0
+
+    def test_stress_has_failures_enabled(self):
+        raw = load_config(
+            "configs/environments/urban_infrastructure_stress.yaml"
+        )
+        config = env_config_from_dict(raw)
+        assert config.failures.camera_dropout_prob > 0
+
+    def test_mixed_has_dr_enabled(self):
+        raw = load_config("configs/environments/urban_mixed.yaml")
+        config = env_config_from_dict(raw)
+        assert config.domain_randomization.enabled is True
