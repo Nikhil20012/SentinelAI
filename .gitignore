@@ -25,6 +25,7 @@ Thumbs.db
 
 # Experiment outputs
 evaluation/results/
+evaluation/simulator_validation/*.png
 wandb/
 checkpoints/
 
