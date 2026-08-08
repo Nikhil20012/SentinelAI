@@ -56,7 +56,7 @@ class ResourceConfig:
 @dataclass
 class DomainRandomizationConfig:
     """Ranges for domain randomization during training."""
-    enabled: bool = True
+    enabled: bool = False
     camera_count_range: list[int] = field(default_factory=lambda: [10, 60])
     gpu_budget_range: list[float] = field(default_factory=lambda: [60.0, 120.0])
     bandwidth_budget_range: list[float] = field(default_factory=lambda: [60.0, 120.0])
